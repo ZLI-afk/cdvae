@@ -1,3 +1,6 @@
+"""Decoder decode from (z, ~X, ~A) to (dX, p_A_hat)
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +22,7 @@ class GemNetTDecoder(nn.Module):
 
     def __init__(
         self,
+        num_blocks=3,
         hidden_dim=128,
         latent_dim=256,
         max_neighbors=20,
@@ -30,6 +34,7 @@ class GemNetTDecoder(nn.Module):
         self.max_num_neighbors = max_neighbors
 
         self.gemnet = GemNetT(
+            num_blocks=num_blocks,
             num_targets=1,
             latent_dim=latent_dim,
             emb_size_atom=hidden_dim,
@@ -68,5 +73,6 @@ class GemNetTDecoder(nn.Module):
             to_jimages=None,
             num_bonds=None,
         )
+        # from emb of p_A to category of atom types (unnormalized)
         pred_atom_types = self.fc_atom(h)
         return pred_cart_coord_diff, pred_atom_types

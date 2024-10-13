@@ -1,30 +1,73 @@
-"""This module is adapted from https://github.com/Open-Catalyst-Project/ocp/tree/master/ocpmodels/models
+"""This module is adapted from
+https://github.com/Open-Catalyst-Project/ocp/tree/master/ocpmodels/models
+DimeNet++
 """
+import warnings
+from math import sqrt
 
+import hydra
+import omegaconf
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from torch_scatter import scatter
-from torch_geometric.nn.acts import swish
 from torch_geometric.nn.inits import glorot_orthogonal
 from torch_geometric.nn.models.dimenet import (
     BesselBasisLayer,
-    EmbeddingBlock,
     ResidualLayer,
     SphericalBasisLayer,
 )
+from torch_scatter import scatter
 from torch_sparse import SparseTensor
 
 from cdvae.common.data_utils import (
-    get_pbc_distances,
     frac_to_cart_coords,
+    get_pbc_distances,
     radius_graph_pbc_wrapper,
 )
+from cdvae.common.utils import PROJECT_ROOT
+from cdvae.pl_modules.embeddings import KHOT_EMBEDDINGS, MAX_ATOMIC_NUM
 from cdvae.pl_modules.gemnet.gemnet import GemNetT
+from cdvae.pl_modules.gemnet.layers.embedding_block import AtomEmbedding
 
 try:
     import sympy as sym
 except ImportError:
     sym = None
+
+
+class ScaledSiLU(nn.Module):
+    def __init__(self, factor=1):
+        super().__init__()
+        self.scale_factor = factor
+        self._activation = nn.SiLU()
+
+    def forward(self, x):
+        return self._activation(x) * self.scale_factor
+
+
+class EmbeddingBlock(nn.Module):
+    """Modified EmbeddingBlock
+
+    concatenate [xi, xj, rbf]
+    """
+
+    def __init__(self, num_radial, hidden_channels, act=nn.SiLU()):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.act = act
+
+        self.lin_rbf = nn.Linear(num_radial, hidden_channels)
+        self.lin = nn.Linear(3 * hidden_channels, hidden_channels)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lin_rbf.reset_parameters()
+        self.lin.reset_parameters()
+
+    def forward(self, x, rbf, i, j):
+        rbf = self.act(self.lin_rbf(rbf))
+        return self.act(self.lin(torch.cat([x[i], x[j], rbf], dim=-1)))
 
 
 class InteractionPPBlock(torch.nn.Module):
@@ -37,7 +80,7 @@ class InteractionPPBlock(torch.nn.Module):
         num_radial,
         num_before_skip,
         num_after_skip,
-        act=swish,
+        act=ScaledSiLU(1),
     ):
         super(InteractionPPBlock, self).__init__()
         self.act = act
@@ -67,10 +110,7 @@ class InteractionPPBlock(torch.nn.Module):
         )
         self.lin = nn.Linear(hidden_channels, hidden_channels)
         self.layers_after_skip = torch.nn.ModuleList(
-            [
-                ResidualLayer(hidden_channels, act)
-                for _ in range(num_after_skip)
-            ]
+            [ResidualLayer(hidden_channels, act) for _ in range(num_after_skip)]
         )
 
         self.reset_parameters()
@@ -136,7 +176,8 @@ class OutputPPBlock(torch.nn.Module):
         out_emb_channels,
         out_channels,
         num_layers,
-        act=swish,
+        act=nn.SiLU(),
+        outact=None,
     ):
         super(OutputPPBlock, self).__init__()
         self.act = act
@@ -147,6 +188,14 @@ class OutputPPBlock(torch.nn.Module):
         for _ in range(num_layers):
             self.lins.append(nn.Linear(out_emb_channels, out_emb_channels))
         self.lin = nn.Linear(out_emb_channels, out_channels, bias=False)
+        if outact is None or outact.lower() == "none":
+            self.outact = nn.Identity()
+        elif outact.lower() == 'tanh':
+            self.outact = nn.Tanh()
+        elif outact.lower() == 'sigmoid':
+            self.outact = nn.Sigmoid()
+        else:
+            raise ValueError(f"Unsuported outact type: {outact}")
 
         self.reset_parameters()
 
@@ -160,11 +209,13 @@ class OutputPPBlock(torch.nn.Module):
 
     def forward(self, x, rbf, i, num_nodes=None):
         x = self.lin_rbf(rbf) * x
-        x = scatter(x, i, dim=0, dim_size=num_nodes)
+        x = scatter(x, i, dim=0, dim_size=num_nodes)  # aggregate by node
         x = self.lin_up(x)
         for lin in self.lins:
             x = self.act(lin(x))
-        return self.lin(x)
+        x = self.lin(x)
+        x = self.outact(x)
+        return x
 
 
 class DimeNetPlusPlus(torch.nn.Module):
@@ -189,27 +240,28 @@ class DimeNetPlusPlus(torch.nn.Module):
         num_output_layers: (int, optional): Number of linear layers for the
             output blocks. (default: :obj:`3`)
         act: (function, optional): The activation funtion.
-            (default: :obj:`swish`)
+            (default: :obj:`swish`, nn.SiLU)
     """
 
     url = "https://github.com/klicperajo/dimenet/raw/master/pretrained"
 
     def __init__(
         self,
-        hidden_channels,
-        out_channels,
-        num_blocks,
-        int_emb_size,
-        basis_emb_size,
-        out_emb_channels,
-        num_spherical,
-        num_radial,
+        out_channels,  # output dim, num_targets
+        hidden_channels=128,  # internal dim
+        num_blocks=4,
+        int_emb_size=64,
+        basis_emb_size=8,
+        out_emb_channels=256,
+        num_spherical=7,
+        num_radial=6,
         cutoff=5.0,
         envelope_exponent=5,
         num_before_skip=1,
         num_after_skip=2,
         num_output_layers=3,
-        act=swish,
+        act=nn.SiLU(),
+        outact=None,
     ):
         super(DimeNetPlusPlus, self).__init__()
 
@@ -221,10 +273,11 @@ class DimeNetPlusPlus(torch.nn.Module):
         self.num_blocks = num_blocks
 
         self.rbf = BesselBasisLayer(num_radial, cutoff, envelope_exponent)
-        self.sbf = SphericalBasisLayer(
+        self.sbf = SphericalBasisLayer(  # require a lot of init time
             num_spherical, num_radial, cutoff, envelope_exponent
         )
 
+        self.atomemb = AtomEmbedding(hidden_channels)
         self.emb = EmbeddingBlock(num_radial, hidden_channels, act)
 
         self.output_blocks = torch.nn.ModuleList(
@@ -236,6 +289,7 @@ class DimeNetPlusPlus(torch.nn.Module):
                     out_channels,
                     num_output_layers,
                     act,
+                    outact,
                 )
                 for _ in range(num_blocks + 1)
             ]
@@ -308,7 +362,7 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
         out_emb_channels=256,
         num_spherical=7,
         num_radial=6,
-        otf_graph=False,
+        otf_graph=False,  # compute edges on the fly
         cutoff=10.0,
         max_num_neighbors=20,
         envelope_exponent=5,
@@ -316,6 +370,7 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
         num_after_skip=2,
         num_output_layers=3,
         readout='mean',
+        outact=None,
     ):
         self.num_targets = num_targets
         self.cutoff = cutoff
@@ -325,8 +380,8 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
         self.readout = readout
 
         super(DimeNetPlusPlusWrap, self).__init__(
-            hidden_channels=hidden_channels,
             out_channels=num_targets,
+            hidden_channels=hidden_channels,
             num_blocks=num_blocks,
             int_emb_size=int_emb_size,
             basis_emb_size=basis_emb_size,
@@ -338,12 +393,16 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
             num_before_skip=num_before_skip,
             num_after_skip=num_after_skip,
             num_output_layers=num_output_layers,
+            outact=outact,
         )
 
-    def forward(self, data):
+        self.linear_cat_c = nn.LazyLinear(hidden_channels)
+
+
+    def forward(self, data, cond_vec=None):
         batch = data.batch
 
-        if self.otf_graph:
+        if self.otf_graph:  # compute new graph data
             edge_index, cell_offsets, neighbors = radius_graph_pbc_wrapper(
                 data, self.cutoff, self.max_num_neighbors, data.num_atoms.device
             )
@@ -352,10 +411,8 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
             data.num_bonds = neighbors
 
         pos = frac_to_cart_coords(
-            data.frac_coords,
-            data.lengths,
-            data.angles,
-            data.num_atoms)
+            data.frac_coords, data.lengths, data.angles, data.num_atoms
+        )
 
         out = get_pbc_distances(
             data.frac_coords,
@@ -365,10 +422,10 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
             data.to_jimages,
             data.num_atoms,
             data.num_bonds,
-            return_offsets=True
+            return_offsets=True,
         )
 
-        edge_index = out["edge_index"]
+        edge_index = out["edge_index"]  # same with data.edge_index
         dist = out["distances"]
         offsets = out["offsets"]
 
@@ -387,14 +444,17 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
         )
 
         a = (pos_ji * pos_kj).sum(dim=-1)
-        b = torch.cross(pos_ji, pos_kj).norm(dim=-1)
+        b = torch.cross(pos_ji, pos_kj, dim=-1).norm(dim=-1)
         angle = torch.atan2(b, a)
 
         rbf = self.rbf(dist)
         sbf = self.sbf(dist, angle, idx_kj)
 
-        # Embedding block.
-        x = self.emb(data.atom_types.long(), rbf, i, j)
+        x = self.atomemb(data.atom_types.long())
+        if cond_vec is not None:
+            cond_vec = torch.repeat_interleave(cond_vec, data.num_atoms, dim=0)
+            x = self.linear_cat_c(torch.cat([x, cond_vec], axis=-1))
+        x = self.emb(x, rbf, i, j)
         P = self.output_blocks[0](x, rbf, i, num_nodes=pos.size(0))
 
         # Interaction blocks.
@@ -402,7 +462,9 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
             self.interaction_blocks, self.output_blocks[1:]
         ):
             x = interaction_block(x, rbf, sbf, idx_kj, idx_ji)
-            P += output_block(x, rbf, i, num_nodes=pos.size(0))
+            P = P + output_block(x, rbf, i, num_nodes=pos.size(0))
+            assert torch.isfinite(x).all(), "explosion in Interaction"
+            assert torch.isfinite(P).all(), "explosion in Interaction"
 
         # Use mean
         if batch is None:
@@ -412,6 +474,7 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
                 energy = P.sum(dim=0)
             elif self.readout == 'cat':
                 import pdb
+
                 pdb.set_trace()
                 energy = torch.cat([P.sum(dim=0), P.mean(dim=0)])
             else:
@@ -419,6 +482,9 @@ class DimeNetPlusPlusWrap(DimeNetPlusPlus):
         else:
             # TODO: if want to use cat, need two lines here
             energy = scatter(P, batch, dim=0, reduce=self.readout)
+
+        if energy.max() > 100:
+            warnings.warn("DimeNet++ output too large, may overflow!")
 
         return energy
 
@@ -468,6 +534,6 @@ class GemNetTEncoder(nn.Module):
             angles=data.angles,
             edge_index=data.edge_index,
             to_jimages=data.to_jimages,
-            num_bonds=data.num_bonds
+            num_bonds=data.num_bonds,
         )
         return output

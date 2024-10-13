@@ -1,24 +1,24 @@
-from collections import Counter
 import argparse
-import os
 import json
+import pickle
+import os
+from collections import Counter
+from pathlib import Path
 
 import numpy as np
-from pathlib import Path
-from tqdm import tqdm
+from matminer.featurizers.composition.composite import ElementProperty
+from matminer.featurizers.site.fingerprint import CrystalNNFingerprint
 from p_tqdm import p_map
-from scipy.stats import wasserstein_distance
-
-from pymatgen.core.structure import Structure
+from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.core.composition import Composition
 from pymatgen.core.lattice import Lattice
-from pymatgen.analysis.structure_matcher import StructureMatcher
-from matminer.featurizers.site.fingerprint import CrystalNNFingerprint
-from matminer.featurizers.composition.composite import ElementProperty
+from pymatgen.core.structure import Structure
+from scipy.stats import wasserstein_distance
+from tqdm import tqdm
 
-from eval_utils import (
-    smact_validity, structure_validity, CompScaler, get_fp_pdist,
-    load_config, load_data, get_crystals_list, prop_model_eval, compute_cov)
+from eval_utils import (CompScaler, compute_cov, get_crystals_list,
+                        get_fp_pdist, load_config, load_data, prop_model_eval,
+                        smact_validity, structure_validity)
 
 CrystalNNFP = CrystalNNFingerprint.from_preset("ops")
 CompFP = ElementProperty.from_preset('magpie')
@@ -104,12 +104,13 @@ class Crystal(object):
 
 class RecEval(object):
 
-    def __init__(self, pred_crys, gt_crys, stol=0.5, angle_tol=10, ltol=0.3):
+    def __init__(self, pred_crys, gt_crys, mp_id, stol=0.5, angle_tol=10, ltol=0.3):
         assert len(pred_crys) == len(gt_crys)
         self.matcher = StructureMatcher(
             stol=stol, angle_tol=angle_tol, ltol=ltol)
         self.preds = pred_crys
         self.gts = gt_crys
+        self.mp_id = mp_id
 
     def get_match_rate_and_rms(self):
         def process_one(pred, gt, is_valid):
@@ -125,14 +126,20 @@ class RecEval(object):
         validity = [c.valid for c in self.preds]
 
         rms_dists = []
-        for i in tqdm(range(len(self.preds))):
-            rms_dists.append(process_one(
-                self.preds[i], self.gts[i], validity[i]))
+        match_id = []
+        for i, mp_id in tqdm(zip(range(len(self.preds)), self.mp_id), ncols=79, total=len(self.preds)):
+            rms_dist = process_one(self.preds[i], self.gts[i], validity[i])
+            rms_dists.append(rms_dist)
+            if rms_dist is not None:
+                match_id.append(mp_id)
         rms_dists = np.array(rms_dists)
         match_rate = sum(rms_dists != None) / len(self.preds)
         mean_rms_dist = rms_dists[rms_dists != None].mean()
-        return {'match_rate': match_rate,
-                'rms_dist': mean_rms_dist}
+        return {
+            'match_rate': match_rate,
+            'rms_dist': mean_rms_dist,
+            'match_id': match_id,
+        }
 
     def get_metrics(self):
         return self.get_match_rate_and_rms()
@@ -140,7 +147,7 @@ class RecEval(object):
 
 class GenEval(object):
 
-    def __init__(self, pred_crys, gt_crys, n_samples=1000, eval_model_name=None):
+    def __init__(self, pred_crys, gt_crys, n_samples=500, eval_model_name=None):
         self.crys = pred_crys
         self.gt_crys = gt_crys
         self.n_samples = n_samples
@@ -211,9 +218,9 @@ class GenEval(object):
         metrics.update(self.get_struct_diversity())
         metrics.update(self.get_density_wdist())
         metrics.update(self.get_num_elem_wdist())
-        metrics.update(self.get_prop_wdist())
+        # metrics.update(self.get_prop_wdist())
         print(metrics)
-        metrics.update(self.get_coverage())
+        # metrics.update(self.get_coverage())
         return metrics
 
 
@@ -297,12 +304,12 @@ def main(args):
 
     if 'recon' in args.tasks:
         recon_file_path = get_file_paths(args.root_path, 'recon', args.label)
-        crys_array_list, true_crystal_array_list = get_crystal_array_list(
-            recon_file_path)
+        crys_array_list, true_crystal_array_list = get_crystal_array_list(recon_file_path)
         pred_crys = p_map(lambda x: Crystal(x), crys_array_list)
         gt_crys = p_map(lambda x: Crystal(x), true_crystal_array_list)
 
-        rec_evaluator = RecEval(pred_crys, gt_crys)
+        mp_id = load_data(recon_file_path)["input_data_batch"].mp_id
+        rec_evaluator = RecEval(pred_crys, gt_crys, mp_id=mp_id)
         recon_metrics = rec_evaluator.get_metrics()
         all_metrics.update(recon_metrics)
 
@@ -315,6 +322,10 @@ def main(args):
             _, true_crystal_array_list = get_crystal_array_list(
                 recon_file_path)
             gt_crys = p_map(lambda x: Crystal(x), true_crystal_array_list)
+        # else:
+        #     cached_data = pickle.load(open(args.train_data, 'rb'))
+        #     batch = cached_data['graph_array']
+        #     true_crystal_array_list = p_map(lambda x: Crystal(x), cached_data)
 
         gen_evaluator = GenEval(
             gen_crys, gt_crys, eval_model_name=eval_model_name)
@@ -360,5 +371,6 @@ if __name__ == '__main__':
     parser.add_argument('--root_path', required=True)
     parser.add_argument('--label', default='')
     parser.add_argument('--tasks', nargs='+', default=['recon', 'gen', 'opt'])
+    parser.add_argument('--train_data', help="sample from trn_cached_data(pkl)")
     args = parser.parse_args()
     main(args)

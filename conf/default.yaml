@@ -1,26 +1,31 @@
+project: comp_cond_crystal_gen
+group: test
 expname: test
 
 # metadata specialised for each experiment
 core:
   version: 0.0.1
   tags:
-    - ${now:%Y-%m-%d}
+    - ${model._target_}
 
 hydra:
   run:
-    dir: ${oc.env:HYDRA_JOBS}/singlerun/${now:%Y-%m-%d}/${expname}/
+    dir: ${oc.env:HYDRA_JOBS}/singlerun/${project}/${group}/${expname}/
 
   sweep:
     dir: ${oc.env:HYDRA_JOBS}/multirun/${now:%Y-%m-%d}/${expname}/
     subdir: ${hydra.job.num}_${hydra.job.id}
 
   job:
+    chdir: true
     env_set:
       WANDB_START_METHOD: thread
-      WANDB_DIR: ${oc.env:WABDB_DIR}
+      # use subdir in running dir, so that git status can be logged
+      # WANDB_DIR: ${oc.env:WANDB_DIR}
 
 defaults:
-  - data: default
+  - _self_
+  - data: ???
   - logging: default
   - model: vae
   - optim: default

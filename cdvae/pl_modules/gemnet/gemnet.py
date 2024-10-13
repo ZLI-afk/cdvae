@@ -3,6 +3,9 @@ Copyright (c) Facebook, Inc. and its affiliates.
 
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
+
+Adapted output of regress_forces, output h_a
+Treat F -> s_X, h_a -> emb of p_A (atom self-interaction, emb_size_atom)
 """
 
 from typing import Optional
@@ -10,28 +13,21 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from cdvae.common.data_utils import (frac_to_cart_coords, get_pbc_distances,
+                                     radius_graph_pbc)
 from torch_scatter import scatter
 from torch_sparse import SparseTensor
-
-from cdvae.common.data_utils import (
-    get_pbc_distances, radius_graph_pbc, frac_to_cart_coords)
 
 from .layers.atom_update_block import OutputBlock
 from .layers.base_layers import Dense
 from .layers.efficient import EfficientInteractionDownProjection
 from .layers.embedding_block import AtomEmbedding, EdgeEmbedding
-from .layers.interaction_block import (
-    InteractionBlockTripletsOnly,
-)
+from .layers.interaction_block import InteractionBlockTripletsOnly
 from .layers.radial_basis import RadialBasis
 from .layers.scaling import AutomaticFit
 from .layers.spherical_basis import CircularBasisLayer
-from .utils import (
-    inner_product_normalized,
-    mask_neighbors,
-    ragged_range,
-    repeat_blocks,
-)
+from .utils import (inner_product_normalized, mask_neighbors, ragged_range,
+                    repeat_blocks)
 
 
 class GemNetT(torch.nn.Module):
@@ -99,7 +95,7 @@ class GemNetT(torch.nn.Module):
     def __init__(
         self,
         num_targets: int,
-        latent_dim: int,
+        latent_dim: int,  # dim of z, change to LazyLinear, not used anymore
         num_spherical: int = 7,
         num_radial: int = 128,
         num_blocks: int = 3,
@@ -191,7 +187,7 @@ class GemNetT(torch.nn.Module):
 
         # Embedding block
         self.atom_emb = AtomEmbedding(emb_size_atom)
-        self.atom_latent_emb = nn.Linear(emb_size_atom + latent_dim, emb_size_atom)
+        self.atom_latent_emb = nn.LazyLinear(emb_size_atom)
         self.edge_emb = EdgeEmbedding(
             emb_size_atom, num_radial, emb_size_edge, activation=activation
         )
@@ -356,7 +352,7 @@ class GemNetT(torch.nn.Module):
 
         # Create indexing array
         edge_reorder_idx = repeat_blocks(
-            neighbors_new // 2,
+            torch.div(neighbors_new, 2, rounding_mode='floor'),
             repeats=2,
             continuous_indexing=True,
             repeat_inc=edge_index_new.size(1),
@@ -470,7 +466,7 @@ class GemNetT(torch.nn.Module):
         )
 
         # Indices for swapping c->a and a->c (for symmetric MP)
-        block_sizes = neighbors // 2
+        block_sizes = torch.div(neighbors, 2, rounding_mode='floor')
         id_swap = repeat_blocks(
             block_sizes,
             repeats=2,

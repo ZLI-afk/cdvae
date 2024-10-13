@@ -3,24 +3,32 @@ from typing import List
 
 import hydra
 import numpy as np
-import torch
 import omegaconf
 import pytorch_lightning as pl
+import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning import seed_everything, Callback
+from pytorch_lightning import Callback, seed_everything
 from pytorch_lightning.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
     ModelCheckpoint,
 )
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.plugins.precision import (
+    DoublePrecisionPlugin,
+    MixedPrecisionPlugin,
+)
+from pytorch_lightning.profilers import SimpleProfiler
 
-from cdvae.common.utils import log_hyperparameters, PROJECT_ROOT
+from cdvae.common.utils import PROJECT_ROOT, log_hyperparameters, set_precision
+
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 
 def build_callbacks(cfg: DictConfig) -> List[Callback]:
     callbacks: List[Callback] = []
+    # callbacks.append(BatchSizeFinder())
 
     if "lr_monitor" in cfg.logging:
         hydra.utils.log.info("Adding callback <LearningRateMonitor>")
@@ -57,12 +65,15 @@ def build_callbacks(cfg: DictConfig) -> List[Callback]:
     return callbacks
 
 
-def run(cfg: DictConfig) -> None:
+def run(cfg: DictConfig):
+    # print(cfg)
     """
     Generic train loop
 
     :param cfg: run configuration, defined by Hydra in /conf
     """
+    set_precision(cfg.model.get('prec', 32))
+
     if cfg.train.deterministic:
         seed_everything(cfg.train.random_seed)
 
@@ -72,7 +83,7 @@ def run(cfg: DictConfig) -> None:
             f"Forcing debugger friendly configuration!"
         )
         # Debuggers don't like GPUs nor multiprocessing
-        cfg.train.pl_trainer.gpus = 0
+        # cfg.train.pl_trainer.gpus = 0
         cfg.data.datamodule.num_workers.train = 0
         cfg.data.datamodule.num_workers.val = 0
         cfg.data.datamodule.num_workers.test = 0
@@ -100,11 +111,22 @@ def run(cfg: DictConfig) -> None:
     )
 
     # Pass scaler from datamodule to model
-    hydra.utils.log.info(f"Passing scaler from datamodule to model <{datamodule.scaler}>")
+    hydra.utils.log.info(
+        f"Passing scaler from datamodule to model <{datamodule.lattice_scaler}>"
+    )
     model.lattice_scaler = datamodule.lattice_scaler.copy()
-    model.scaler = datamodule.scaler.copy()
     torch.save(datamodule.lattice_scaler, hydra_dir / 'lattice_scaler.pt')
-    torch.save(datamodule.scaler, hydra_dir / 'prop_scaler.pt')
+    hydra.utils.log.info(
+        f"Passing scaler from datamodule to model <{datamodule.prop_scalers}>"
+    )
+    model.prop_scalers = [scaler.copy() for scaler in datamodule.prop_scalers]
+    torch.save(datamodule.prop_scalers, hydra_dir / 'prop_scalers.pt')
+
+    # forward dummy batch to initialize LazyModel
+    datamodule.setup()
+    dummybatch = next(iter(datamodule.train_dataloader()))
+    model.forward(dummybatch)
+
     # Instantiate the callbacks
     callbacks: List[Callback] = build_callbacks(cfg=cfg)
 
@@ -131,12 +153,14 @@ def run(cfg: DictConfig) -> None:
     # Load checkpoint (if exist)
     ckpts = list(hydra_dir.glob('*.ckpt'))
     if len(ckpts) > 0:
-        ckpt_epochs = np.array([int(ckpt.parts[-1].split('-')[0].split('=')[1]) for ckpt in ckpts])
+        ckpt_epochs = np.array(
+            [int(ckpt.parts[-1].split('-')[0].split('=')[1]) for ckpt in ckpts]
+        )
         ckpt = str(ckpts[ckpt_epochs.argsort()[-1]])
         hydra.utils.log.info(f"found checkpoint: {ckpt}")
     else:
         ckpt = None
-          
+
     hydra.utils.log.info("Instantiating the Trainer")
     trainer = pl.Trainer(
         default_root_dir=hydra_dir,
@@ -144,24 +168,33 @@ def run(cfg: DictConfig) -> None:
         callbacks=callbacks,
         deterministic=cfg.train.deterministic,
         check_val_every_n_epoch=cfg.logging.val_check_interval,
-        progress_bar_refresh_rate=cfg.logging.progress_bar_refresh_rate,
-        resume_from_checkpoint=ckpt,
+        profiler=SimpleProfiler(hydra_dir, "time_report"),
+        # progress_bar_refresh_rate=cfg.logging.progress_bar_refresh_rate,
+        # plugins=[MixedPrecisionPlugin('16', 'cuda')],
+        # plugins=[DoublePrecisionPlugin],
+        # detect_anomaly=True,
         **cfg.train.pl_trainer,
     )
     log_hyperparameters(trainer=trainer, model=model, cfg=cfg)
 
+    # model = torch.compile(model)
     hydra.utils.log.info("Starting training!")
-    trainer.fit(model=model, datamodule=datamodule)
+    trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt)
 
-    hydra.utils.log.info("Starting testing!")
-    trainer.test(datamodule=datamodule)
+    if not cfg.train.pl_trainer.fast_dev_run:
+        hydra.utils.log.info("Starting testing!")
+        trainer.test(datamodule=datamodule)
 
     # Logger closing to release resources/avoid multi-run conflicts
     if wandb_logger is not None:
         wandb_logger.experiment.finish()
 
 
-@hydra.main(config_path=str(PROJECT_ROOT / "conf"), config_name="default")
+@hydra.main(
+    version_base='1.1',
+    config_path=str(PROJECT_ROOT / "conf"),
+    config_name="default",
+)
 def main(cfg: omegaconf.DictConfig):
     run(cfg)
 
